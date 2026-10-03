@@ -21,6 +21,11 @@ SEASONS=["2425","2526","2627"]
 BASE="https://www.football-data.co.uk/mmz4281/{season}/{div}.csv"
 FIXTURES="https://www.football-data.co.uk/matches/resources/fixtures.csv"
 ESPN_BASE="https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
+SPORTSDB_BASE="https://www.thesportsdb.com/api/v1/json/123"
+SPORTSDB_LEAGUES={
+"4328":"E0","4329":"E1","4335":"SP1","4331":"D1","4332":"I1",
+"4334":"F1","4337":"N1","4344":"P1","4338":"B1"
+}
 STATE={"models":{},"fixtures":[],"recommendations":[],"status":"initializing","updated":None,"errors":[],"source_status":{}}
 
 def fnum(x,d=None):
@@ -89,6 +94,27 @@ async def fetch_espn(league, date_from, date_to):
             "AwayTeam":(away.get("team") or {}).get("displayName",""),
             "_source":"ESPN","_event_id":str(ev.get("id","")),
             "_status":((ev.get("status") or {}).get("type") or {}).get("description","Scheduled")
+        })
+    return out
+
+async def fetch_sportsdb_next(league_id, div):
+    url=f"{SPORTSDB_BASE}/eventsnextleague.php?id={league_id}"
+    async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers={"User-Agent":"EDGE90/1.1"}) as c:
+        r=await c.get(url);r.raise_for_status();data=r.json()
+    out=[]
+    for ev in data.get("events") or []:
+        ds=ev.get("dateEvent") or ""
+        date_txt=""
+        if ds:
+            try: date_txt=datetime.strptime(ds,"%Y-%m-%d").strftime("%d/%m/%y")
+            except: date_txt=ds
+        tm=(ev.get("strTime") or "")[:5]
+        out.append({
+            "Div":div,"Date":date_txt,"Time":tm,
+            "HomeTeam":ev.get("strHomeTeam") or "",
+            "AwayTeam":ev.get("strAwayTeam") or "",
+            "_source":"TheSportsDB","_event_id":str(ev.get("idEvent") or ""),
+            "_status":"Scheduled"
         })
     return out
 
@@ -176,6 +202,19 @@ async def rebuild():
         else:
             fixtures.extend(res)
     source_status["schedule"]="ok" if fixtures else "error"
+
+    # Official/free fallback. The free tier may expose only a limited number
+    # of upcoming fixtures per league, but it prevents an empty app when
+    # another schedule provider blocks the server.
+    if not fixtures:
+        tsdb=await asyncio.gather(*[fetch_sportsdb_next(lid,div) for lid,div in SPORTSDB_LEAGUES.items()],return_exceptions=True)
+        for lid,res in zip(SPORTSDB_LEAGUES,tsdb):
+            if isinstance(res,Exception):
+                errors.append(f"sportsdb {lid}:{type(res).__name__}")
+            else:
+                fixtures.extend(res)
+        if fixtures:
+            source_status["schedule"]="fallback"
 
     # Secondary fixture/odds source.
     try:
