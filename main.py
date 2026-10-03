@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-import httpx, csv, io, math, random, asyncio, difflib, re
+import httpx, csv, io, math, random, asyncio, difflib, re, os
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
@@ -27,6 +27,7 @@ BASE="https://www.football-data.co.uk/mmz4281/{season}/{div}.csv"
 FIXTURES="https://www.football-data.co.uk/matches/resources/fixtures.csv"
 ESPN_BASE="https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
 SPORTSDB_BASE="https://www.thesportsdb.com/api/v1/json/123"
+API_FOOTBALL_BASE="https://v3.football.api-sports.io"
 OPENLIGA_BASE="https://api.openligadb.de"
 OPENLIGA_KNOWN={"bl1":"D1","bl2":"D2","dfb":"GLOBAL","cl":"UCL","el":"UEL"}
 SPORTSDB_LEAGUES={
@@ -130,6 +131,47 @@ async def fetch_sportsdb_next(league_id, div):
             "_source":"TheSportsDB","_event_id":str(ev.get("idEvent") or ""),
             "_status":"Scheduled"
         })
+    return out
+
+async def fetch_api_football(date_from,date_to):
+    key=(os.getenv("API_FOOTBALL_KEY") or "").strip()
+    if not key:
+        return []
+    out=[]
+    headers={"x-apisports-key":key,"Accept":"application/json"}
+    async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers=headers) as c:
+        d=date_from
+        while d<=date_to:
+            try:
+                r=await c.get(f"{API_FOOTBALL_BASE}/fixtures",params={"date":d.isoformat(),"timezone":"Europe/Madrid"})
+                r.raise_for_status()
+                data=r.json()
+                if data.get("errors"):
+                    raise RuntimeError(str(data.get("errors")))
+                for item in data.get("response") or []:
+                    fx=item.get("fixture") or {}; lg=item.get("league") or {}; teams=item.get("teams") or {}
+                    home=(teams.get("home") or {}).get("name") or ""
+                    away=(teams.get("away") or {}).get("name") or ""
+                    if not home or not away: continue
+                    dt=fx.get("date") or ""
+                    try:
+                        z=datetime.fromisoformat(dt.replace("Z","+00:00"))
+                        local=z.astimezone(timezone(timedelta(hours=2)))
+                        date_txt=local.strftime("%d/%m/%y"); time_txt=local.strftime("%H:%M")
+                    except Exception:
+                        date_txt=d.strftime("%d/%m/%y"); time_txt=""
+                    out.append({
+                        "Div":f"APIF:{lg.get('id','')}",
+                        "Date":date_txt,"Time":time_txt,
+                        "HomeTeam":home,"AwayTeam":away,
+                        "_source":"API-Football","_event_id":str(fx.get("id") or ""),
+                        "_status":((fx.get("status") or {}).get("short") or "NS"),
+                        "_league_name":lg.get("name") or "Football",
+                        "_country":lg.get("country") or ""
+                    })
+            except Exception:
+                pass
+            d+=timedelta(days=1)
     return out
 
 async def fetch_openliga(date_from,date_to):
@@ -259,8 +301,17 @@ async def rebuild():
     today=datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=2))).date()
     end=today+timedelta(days=6)
 
-    # 1) Fixtures first: the UI should never wait for historical model training.
+    # 1) Fixtures first: API-Football primary source when configured.
     fixtures=[]
+    try:
+        apif=await fetch_api_football(today,end)
+        fixtures.extend(apif)
+        source_status["api_football"]="ok" if apif else ("not_configured" if not (os.getenv("API_FOOTBALL_KEY") or "").strip() else "empty")
+    except Exception as e:
+        errors.append(f"api_football:{type(e).__name__}")
+        source_status["api_football"]="error"
+
+    # Independent fallback provider.
     espn_tasks=[fetch_espn(lg,today,end) for lg in ESPN_LEAGUES]
     espn_results=await asyncio.gather(*espn_tasks,return_exceptions=True)
     for lg,res in zip(ESPN_LEAGUES,espn_results):
@@ -374,11 +425,11 @@ async def startup():
     asyncio.create_task(refresh_loop())
 
 @app.get("/api/health")
-def health(): return {"ok":True,"status":STATE["status"],"models":len(STATE["models"]),"fixtures":len(STATE["fixtures"]),"recommendations":len(STATE["recommendations"]),"updated":STATE["updated"],"errors":STATE["errors"],"source_status":STATE.get("source_status",{})}
+def health(): return {"ok":True,"status":STATE["status"],"models":len(STATE["models"]),"fixtures":len(STATE["fixtures"]),"recommendations":len(STATE["recommendations"]),"updated":STATE["updated"],"errors":STATE["errors"],"source_status":STATE.get("source_status",{}),"api_football_configured":bool((os.getenv("API_FOOTBALL_KEY") or "").strip())}
 
 @app.get("/api/overview")
 def overview():
-    return {"status":STATE["status"],"updated":STATE["updated"],"models":[{"league":m.name,"matches":m.n,**m.metrics} for m in STATE["models"].values()],"count":len(STATE["recommendations"]),"source":"ESPN schedules + Football-Data.co.uk historical/odds reference","source_status":STATE.get("source_status",{})}
+    return {"status":STATE["status"],"updated":STATE["updated"],"models":[{"league":m.name,"matches":m.n,**m.metrics} for m in STATE["models"].values()],"count":len(STATE["recommendations"]),"source":"ESPN schedules + Football-Data.co.uk historical/odds reference","source_status":STATE.get("source_status",{}),"api_football_configured":bool((os.getenv("API_FOOTBALL_KEY") or "").strip())}
 
 @app.post("/api/refresh")
 async def refresh(): await rebuild(); return overview()
@@ -430,7 +481,8 @@ def analyze_fixtures(batch:FixtureBatch):
                 "odds":chosen_odds,"edge":None,"market":market_label,
                 "quality":"Mercado" if market_prob else "Sin modelo","sample_size":0,
                 "source":row.get("_source","Calendario público"),"event_status":row.get("_status","Scheduled"),
-                "probability_source":"market" if market_prob else "none"
+                "probability_source":"market" if market_prob else "none",
+                "league":row.get("_league_name") or LEAGUES.get(div,div or "Competición")
             })
             continue
         try:
