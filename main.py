@@ -27,6 +27,8 @@ BASE="https://www.football-data.co.uk/mmz4281/{season}/{div}.csv"
 FIXTURES="https://www.football-data.co.uk/matches/resources/fixtures.csv"
 ESPN_BASE="https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
 SPORTSDB_BASE="https://www.thesportsdb.com/api/v1/json/123"
+OPENLIGA_BASE="https://api.openligadb.de"
+OPENLIGA_KNOWN={"bl1":"D1","bl2":"D2","dfb":"GLOBAL","cl":"UCL","el":"UEL"}
 SPORTSDB_LEAGUES={
 "4328":"E0","4329":"E1","4335":"SP1","4331":"D1","4332":"I1",
 "4334":"F1","4337":"N1","4344":"P1","4338":"B1"
@@ -130,6 +132,59 @@ async def fetch_sportsdb_next(league_id, div):
         })
     return out
 
+async def fetch_openliga(date_from,date_to):
+    async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers={"User-Agent":"EDGE90/1.2"}) as c:
+        r=await c.get(f"{OPENLIGA_BASE}/getavailableleagues/{date_from.year}")
+        r.raise_for_status()
+        leagues=r.json() or []
+        # Prefer football leagues and cap requests to stay comfortably under the 60/min public limit.
+        football=[]
+        for lg in leagues:
+            sport=(lg.get("sport") or {})
+            sport_name=str(sport.get("sportName") or lg.get("sportName") or "").lower()
+            if sport_name and not any(x in sport_name for x in ("fußball","fussball","football","soccer")):
+                continue
+            sc=lg.get("leagueShortcut") or lg.get("shortcut")
+            ss=str(lg.get("leagueSeason") or date_from.year)
+            if sc: football.append((sc,ss,lg.get("leagueName") or sc))
+        football=football[:24]
+
+        async def one(sc,ss,name):
+            try:
+                rr=await c.get(f"{OPENLIGA_BASE}/getmatchdata/{sc}/{ss}")
+                rr.raise_for_status()
+                return sc,name,rr.json() or []
+            except Exception:
+                return sc,name,[]
+
+        rows=await asyncio.gather(*[one(sc,ss,name) for sc,ss,name in football])
+
+    out=[]
+    for sc,name,matches in rows:
+        for m in matches:
+            dt=m.get("matchDateTimeUTC") or m.get("matchDateTime")
+            if not dt: continue
+            try:
+                d=datetime.fromisoformat(str(dt).replace("Z","+00:00"))
+                local=d.astimezone(timezone(timedelta(hours=2)))
+                if not (date_from <= local.date() <= date_to): continue
+                date_txt=local.strftime("%d/%m/%y"); time_txt=local.strftime("%H:%M")
+            except Exception:
+                continue
+            t1=m.get("team1") or {}; t2=m.get("team2") or {}
+            home=t1.get("teamName") or t1.get("shortName") or ""
+            away=t2.get("teamName") or t2.get("shortName") or ""
+            if not home or not away: continue
+            div=OPENLIGA_KNOWN.get(str(sc).lower(),f"OL:{sc}")
+            out.append({
+                "Div":div,"Date":date_txt,"Time":time_txt,
+                "HomeTeam":home,"AwayTeam":away,
+                "_source":"OpenLigaDB","_event_id":str(m.get("matchID") or ""),
+                "_status":"Finished" if m.get("matchIsFinished") else "Scheduled",
+                "_league_name":name
+            })
+    return out
+
 class LeagueModel:
     def __init__(self,div,rows,do_backtest=True):
         self.div=div; self.name=LEAGUES.get(div,div)
@@ -214,6 +269,15 @@ async def rebuild():
         else:
             fixtures.extend(res)
     source_status["schedule"]="ok" if fixtures else "error"
+
+    # Second independent no-key provider.
+    try:
+        ol=await fetch_openliga(today,end)
+        fixtures.extend(ol)
+        source_status["openligadb"]="ok" if ol else "empty"
+    except Exception as e:
+        errors.append(f"openligadb:{type(e).__name__}")
+        source_status["openligadb"]="error"
 
     # Official/free fallback. The free tier may expose only a limited number
     # of upcoming fixtures per league, but it prevents an empty app when
@@ -505,6 +569,32 @@ async function loadMatches(){
     const k=[x.Date,x.Time,x.HomeTeam,x.AwayTeam].join('|').toLowerCase();
     if(seen.has(k)) return false; seen.add(k); return true;
   });
+
+  // Third independent fallback: OpenLigaDB, no key required.
+  if(!fixtures.length){
+    try{
+      const ar=await fetch('https://api.openligadb.de/getavailableleagues/'+now.getFullYear(),{cache:'no-store'});
+      if(ar.ok){
+        const av=await ar.json();
+        const chosen=(av||[]).slice(0,20);
+        const rs=await Promise.all(chosen.map(async lg=>{
+          try{
+            const sc=lg.leagueShortcut, ss=lg.leagueSeason;
+            const rr=await fetch('https://api.openligadb.de/getmatchdata/'+encodeURIComponent(sc)+'/'+encodeURIComponent(ss),{cache:'no-store'});
+            if(!rr.ok)return[];
+            const ms=await rr.json();
+            return (ms||[]).map(m=>{
+              const dt=new Date(m.matchDateTimeUTC||m.matchDateTime);
+              if(Number.isNaN(dt.getTime())||dt<now||dt>endDate)return null;
+              const known={"bl1":"D1","bl2":"D2","cl":"UCL","el":"UEL"};
+              return {Div:known[String(sc).toLowerCase()]||('OL:'+sc),Date:dmy(dt),Time:String(dt.getHours()).padStart(2,'0')+':'+String(dt.getMinutes()).padStart(2,'0'),HomeTeam:m.team1?.teamName||'',AwayTeam:m.team2?.teamName||'',_source:'OpenLigaDB',_status:m.matchIsFinished?'Finished':'Scheduled',_league_name:lg.leagueName||sc};
+            }).filter(x=>x&&x.HomeTeam&&x.AwayTeam);
+          }catch(e){return[]}
+        }));
+        fixtures=rs.flat();
+      }
+    }catch(e){}
+  }
 
   if(!fixtures.length){
     try{
