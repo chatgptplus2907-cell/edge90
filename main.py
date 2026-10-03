@@ -438,28 +438,31 @@ function renderMatches(){let threshold=+$('#ps').value/100;let items=all.filter(
 async function loadMatches(){
   let fixtures=[];
   const leagues={
-"eng.1":"E0","eng.2":"E1","eng.3":"E2","eng.4":"E3",
-"sco.1":"SC0","sco.2":"SC1","sco.3":"SC2","sco.4":"SC3",
-"esp.1":"SP1","esp.2":"SP2","ger.1":"D1","ger.2":"D2","ita.1":"I1","ita.2":"I2","fra.1":"F1","fra.2":"F2",
-"ned.1":"N1","por.1":"P1","bel.1":"B1","tur.1":"T1","gre.1":"G1",
-"usa.1":"MLS","mex.1":"MEX1","bra.1":"BRA1","arg.1":"ARG1","jpn.1":"JPN1","aus.1":"AUS1",
-"uefa.champions":"UCL","uefa.europa":"UEL","uefa.europa.conf":"UECL",
-"fifa.friendly":"INT-FRIENDLY","fifa.worldq.uefa":"WCQ-UEFA","fifa.worldq.conmebol":"WCQ-CONMEBOL",
-"fifa.worldq.concacaf":"WCQ-CONCACAF","fifa.worldq.afc":"WCQ-AFC","fifa.worldq.caf":"WCQ-CAF","uefa.nations":"UNL"
-};
-  const now=new Date(), end=new Date(now.getTime()+14*86400000);
+    "eng.1":"E0","eng.2":"E1","eng.3":"E2","eng.4":"E3",
+    "sco.1":"SC0","sco.2":"SC1","sco.3":"SC2","sco.4":"SC3",
+    "esp.1":"SP1","esp.2":"SP2","ger.1":"D1","ger.2":"D2","ita.1":"I1","ita.2":"I2",
+    "fra.1":"F1","fra.2":"F2","ned.1":"N1","por.1":"P1","bel.1":"B1","tur.1":"T1","gre.1":"G1",
+    "usa.1":"MLS","mex.1":"MEX1","bra.1":"BRA1","arg.1":"ARG1","jpn.1":"JPN1","aus.1":"AUS1",
+    "uefa.champions":"UCL","uefa.europa":"UEL","uefa.europa.conf":"UECL",
+    "fifa.friendly":"INT-FRIENDLY","fifa.worldq.uefa":"WCQ-UEFA","fifa.worldq.conmebol":"WCQ-CONMEBOL",
+    "fifa.worldq.concacaf":"WCQ-CONCACAF","fifa.worldq.afc":"WCQ-AFC","fifa.worldq.caf":"WCQ-CAF","uefa.nations":"UNL"
+  };
+  const now=new Date(), endDate=new Date(now.getTime()+14*86400000);
   const fmt=d=>d.getFullYear()+String(d.getMonth()+1).padStart(2,'0')+String(d.getDate()).padStart(2,'0');
+  const ymd=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  const dmy=d=>String(d.getDate()).padStart(2,'0')+'/'+String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getFullYear()).slice(-2);
+
+  // Primary: broad ESPN competition coverage.
   try{
     const rs=await Promise.all(Object.entries(leagues).map(async([lg,div])=>{
       try{
-        const u='https://site.api.espn.com/apis/site/v2/sports/soccer/'+lg+'/scoreboard?dates='+fmt(now)+'-'+fmt(end)+'&limit=200';
-        const r=await fetch(u); if(!r.ok) return []; const d=await r.json();
+        const u='https://site.api.espn.com/apis/site/v2/sports/soccer/'+lg+'/scoreboard?dates='+fmt(now)+'-'+fmt(endDate)+'&limit=200';
+        const r=await fetch(u,{cache:'no-store'}); if(!r.ok) return []; const d=await r.json();
         return (d.events||[]).map(ev=>{
           const c=(ev.competitions||[{}])[0], cs=c.competitors||[];
           const h=cs.find(x=>x.homeAway==='home'), a=cs.find(x=>x.homeAway==='away');
           if(!h||!a)return null;
-          const dt=new Date(ev.date), dd=String(dt.getDate()).padStart(2,'0')+'/'+String(dt.getMonth()+1).padStart(2,'0')+'/'+String(dt.getFullYear()).slice(-2);
-          const tm=String(dt.getHours()).padStart(2,'0')+':'+String(dt.getMinutes()).padStart(2,'0');
+          const dt=new Date(ev.date), dd=dmy(dt), tm=String(dt.getHours()).padStart(2,'0')+':'+String(dt.getMinutes()).padStart(2,'0');
           const oo=(c.odds||[])[0]||{};
           const ml={home:oo.homeTeamOdds?.moneyLine??oo.homeTeamOdds?.moneyline??null,draw:oo.drawOdds?.moneyLine??oo.drawOdds?.moneyline??null,away:oo.awayTeamOdds?.moneyLine??oo.awayTeamOdds?.moneyline??null};
           return {Div:div,Date:dd,Time:tm,HomeTeam:h.team.displayName,AwayTeam:a.team.displayName,_source:'ESPN',_status:ev.status?.type?.description||'Scheduled',_moneyline:ml};
@@ -468,18 +471,62 @@ async function loadMatches(){
     }));
     fixtures=rs.flat();
   }catch(e){}
+
+  // Guaranteed daily fallback: TheSportsDB daily schedule, queried from the browser.
+  // Free API documents up to 3 events per day.
   if(!fixtures.length){
     try{
-      const r=await fetch('/api/matches'),d=await r.json();all=d.items||[];renderDates();renderMatches();return;
+      const days=[];
+      for(let i=0;i<14;i++){const d=new Date(now.getTime()+i*86400000);days.push(d);}
+      const rs=await Promise.all(days.map(async d=>{
+        try{
+          const u='https://www.thesportsdb.com/api/v1/json/123/eventsday.php?d='+ymd(d)+'&s=Soccer';
+          const r=await fetch(u,{cache:'no-store'}); if(!r.ok) return [];
+          const data=await r.json();
+          return (data.events||[]).map(ev=>({
+            Div:'GLOBAL',
+            Date:(ev.dateEvent?ev.dateEvent.split('-').reverse().join('/').replace(/^([0-9]{2})\/([0-9]{2})\/([0-9]{4})$/,(m,a,b,c)=>a+'/'+b+'/'+c.slice(-2)):dmy(d)),
+            Time:(ev.strTime||'').slice(0,5),
+            HomeTeam:ev.strHomeTeam||'',
+            AwayTeam:ev.strAwayTeam||'',
+            _source:'TheSportsDB',
+            _status:'Scheduled',
+            _league_name:ev.strLeague||'Fútbol'
+          })).filter(x=>x.HomeTeam&&x.AwayTeam);
+        }catch(e){return []}
+      }));
+      fixtures=rs.flat();
     }catch(e){}
   }
+
+  // Deduplicate.
+  const seen=new Set();
+  fixtures=fixtures.filter(x=>{
+    const k=[x.Date,x.Time,x.HomeTeam,x.AwayTeam].join('|').toLowerCase();
+    if(seen.has(k)) return false; seen.add(k); return true;
+  });
+
+  if(!fixtures.length){
+    try{
+      const r=await fetch('/api/matches',{cache:'no-store'}),d=await r.json();all=d.items||[];
+      renderDates();renderMatches();return;
+    }catch(e){}
+  }
+
   if(fixtures.length){
     try{
       const r=await fetch('/api/analyze-fixtures',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fixtures})});
       const d=await r.json();all=d.items||[];
+      // Preserve competition name from public source for unsupported GLOBAL fixtures.
+      all=all.map((x,i)=>{
+        const src=fixtures[i]||{};
+        if(x.div==='GLOBAL' && src._league_name) x.league=src._league_name;
+        return x;
+      });
     }catch(e){all=[]}
   }
-  const td=String(now.getDate()).padStart(2,'0')+'/'+String(now.getMonth()+1).padStart(2,'0')+'/'+String(now.getFullYear()).slice(-2);
+
+  const td=dmy(now);
   if(all.some(x=>x.date===td)) activeDate=td; else activeDate='all';
   renderDates();renderMatches();
 }
