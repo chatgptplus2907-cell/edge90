@@ -162,19 +162,11 @@ async def fetch(url):
         r=await c.get(url);r.raise_for_status();return r.text
 
 async def rebuild():
-    errors=[];models={}; source_status={}
-    for div in LEAGUES:
-        rows=[]
-        for season in SEASONS:
-            try: rows+=parse_csv(await fetch(BASE.format(season=season,div=div)))
-            except Exception as e: errors.append(f"{div}/{season}:{type(e).__name__}")
-        if len(rows)>=40:
-            try: models[div]=LeagueModel(div,rows)
-            except Exception as e: errors.append(f"model {div}:{type(e).__name__}")
-    source_status["historical"]="ok" if models else "error"
-
+    errors=[]; source_status={}
     today=datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=2))).date()
     end=today+timedelta(days=6)
+
+    # 1) Fixtures first: the UI should never wait for historical model training.
     fixtures=[]
     espn_tasks=[fetch_espn(lg,today,end) for lg in ESPN_LEAGUES]
     espn_results=await asyncio.gather(*espn_tasks,return_exceptions=True)
@@ -185,37 +177,74 @@ async def rebuild():
             fixtures.extend(res)
     source_status["schedule"]="ok" if fixtures else "error"
 
-    # Add football-data fixture rows as a secondary source and deduplicate.
+    # Secondary fixture/odds source.
     try:
         fd=parse_csv(await fetch(FIXTURES))
         fixtures.extend(fd)
         source_status["odds_reference"]="ok"
     except Exception as e:
-        errors.append(f"fixtures:{type(e).__name__}"); source_status["odds_reference"]="error"
+        errors.append(f"fixtures:{type(e).__name__}")
+        source_status["odds_reference"]="error"
 
     uniq={}
     for row in fixtures:
         key=(row.get("Div"),row.get("Date"),norm_team(row.get("HomeTeam")),norm_team(row.get("AwayTeam")))
-        if key not in uniq or row.get("_source")=="ESPN": uniq[key]=row
+        if key not in uniq or row.get("_source")=="ESPN":
+            uniq[key]=row
     fixtures=list(uniq.values())
+    STATE.update({"fixtures":fixtures,"status":"fixtures_loaded" if fixtures else "loading","updated":datetime.now(timezone.utc).isoformat(),"errors":errors[-20:],"source_status":source_status})
 
+    # 2) Historical datasets in parallel.
+    async def load_div(div):
+        tasks=[fetch(BASE.format(season=season,div=div)) for season in SEASONS]
+        results=await asyncio.gather(*tasks,return_exceptions=True)
+        rows=[]
+        local_errors=[]
+        for season,res in zip(SEASONS,results):
+            if isinstance(res,Exception):
+                local_errors.append(f"{div}/{season}:{type(res).__name__}")
+            else:
+                try: rows+=parse_csv(res)
+                except Exception as e: local_errors.append(f"{div}/{season}:parse-{type(e).__name__}")
+        return div,rows,local_errors
+
+    hist=await asyncio.gather(*[load_div(div) for div in LEAGUES])
+    models={}
+    for div,rows,errs in hist:
+        errors.extend(errs)
+        if len(rows)>=40:
+            try:
+                # Fast production path. Full diagnostics can be computed separately.
+                models[div]=LeagueModel(div,rows,do_backtest=False)
+            except Exception as e:
+                errors.append(f"model {div}:{type(e).__name__}")
+    source_status["historical"]="ok" if models else "error"
+
+    # 3) Generate one suggestion for every real fixture whose competition has a model.
     recs=[]
     for row in fixtures:
         div=row.get("Div")
-        if div in models and row.get("HomeTeam") and row.get("AwayTeam"):
-            try:
-                teams=set(models[div].attack.keys())|set(models[div].defence.keys())
-                row=dict(row)
-                row["HomeTeam"]=resolve_team(row["HomeTeam"],teams)
-                row["AwayTeam"]=resolve_team(row["AwayTeam"],teams)
-                rr=recommendation(models[div],row)
-                rr["source"]=row.get("_source","Football-Data.co.uk")
-                rr["event_status"]=row.get("_status","Scheduled")
-                rr["event_id"]=row.get("_event_id")
-                recs.append(rr)
-            except Exception as e:
-                errors.append(f"rec {div}:{type(e).__name__}")
-    STATE.update({"models":models,"fixtures":fixtures,"recommendations":recs,"status":"live" if recs else ("historical_only" if models else "offline"),"updated":datetime.now(timezone.utc).isoformat(),"errors":errors[-20:],"source_status":source_status})
+        if div not in models or not row.get("HomeTeam") or not row.get("AwayTeam"):
+            continue
+        try:
+            teams=set(models[div].attack.keys())|set(models[div].defence.keys())
+            rrrow=dict(row)
+            rrrow["HomeTeam"]=resolve_team(rrrow["HomeTeam"],teams)
+            rrrow["AwayTeam"]=resolve_team(rrrow["AwayTeam"],teams)
+            rr=recommendation(models[div],rrrow)
+            rr["source"]=row.get("_source","Football-Data.co.uk")
+            rr["event_status"]=row.get("_status","Scheduled")
+            rr["event_id"]=row.get("_event_id")
+            recs.append(rr)
+        except Exception as e:
+            errors.append(f"rec {div}:{type(e).__name__}")
+
+    STATE.update({
+        "models":models,"fixtures":fixtures,"recommendations":recs,
+        "status":"live" if recs else ("fixtures_loaded" if fixtures else ("historical_only" if models else "offline")),
+        "updated":datetime.now(timezone.utc).isoformat(),"errors":errors[-20:],"source_status":source_status
+    })
+    print("EDGE90_REBUILD",{"fixtures":len(fixtures),"models":len(models),"recommendations":len(recs),"sources":source_status,"errors":errors[-8:]},flush=True)
 
 async def refresh_loop():
     while True:
