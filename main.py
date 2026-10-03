@@ -426,6 +426,17 @@ async def startup():
 
 @app.get("/api/health")
 def health(): return {"ok":True,"status":STATE["status"],"models":len(STATE["models"]),"fixtures":len(STATE["fixtures"]),"recommendations":len(STATE["recommendations"]),"updated":STATE["updated"],"errors":STATE["errors"],"source_status":STATE.get("source_status",{}),"api_football_configured":bool((os.getenv("API_FOOTBALL_KEY") or "").strip())}
+@app.get("/api/provider-test")
+async def provider_test():
+    today=datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=2))).date()
+    rows=await fetch_api_football(today,today)
+    return {
+        "configured":bool((os.getenv("API_FOOTBALL_KEY") or "").strip()),
+        "date":today.isoformat(),
+        "count":len(rows),
+        "sample":[{"home":r.get("HomeTeam"),"away":r.get("AwayTeam"),"league":r.get("_league_name"),"time":r.get("Time")} for r in rows[:8]]
+    }
+
 
 @app.get("/api/overview")
 def overview():
