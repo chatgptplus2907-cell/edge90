@@ -323,6 +323,39 @@ def matches():
     out.sort(key=lambda x:(x.get("date",""),x.get("kickoff",""),x.get("league",""),x.get("home","")))
     return {"items":out,"count":len(out),"status":STATE["status"],"updated":STATE["updated"]}
 
+class FixtureBatch(BaseModel):
+    fixtures:list[dict]
+
+@app.post("/api/analyze-fixtures")
+def analyze_fixtures(batch:FixtureBatch):
+    out=[]
+    for i,row in enumerate(batch.fixtures):
+        div=row.get("Div")
+        model=STATE["models"].get(div)
+        if not model or not row.get("HomeTeam") or not row.get("AwayTeam"):
+            out.append({
+                "id":i+1,"div":div,"league":LEAGUES.get(div,div or "Competición"),
+                "home":row.get("HomeTeam",""),"away":row.get("AwayTeam",""),
+                "date":row.get("Date",""),"kickoff":row.get("Time",""),
+                "probability":None,"lower":None,"upper":None,"fair_odds":None,"odds":None,"edge":None,
+                "market":"Modelo preparando datos","quality":"Pendiente","sample_size":0,
+                "source":row.get("_source","Calendario público"),"event_status":row.get("_status","Scheduled")
+            })
+            continue
+        try:
+            teams=set(model.attack.keys())|set(model.defence.keys())
+            rrrow=dict(row)
+            rrrow["HomeTeam"]=resolve_team(rrrow["HomeTeam"],teams)
+            rrrow["AwayTeam"]=resolve_team(rrrow["AwayTeam"],teams)
+            rr=recommendation(model,rrrow)
+            rr["id"]=i+1;rr["source"]=row.get("_source","Calendario público")
+            rr["event_status"]=row.get("_status","Scheduled")
+            out.append(rr)
+        except Exception:
+            pass
+    out.sort(key=lambda x:(x.get("date",""),x.get("kickoff",""),x.get("league",""),x.get("home","")))
+    return {"items":out,"count":len(out),"models_ready":len(STATE["models"]),"updated":STATE["updated"]}
+
 class Challenge(BaseModel):
     bankroll:float=100
     target:float=500
@@ -374,14 +407,48 @@ const $=s=>document.querySelector(s);let all=[],activeDate='all';function pc(x){
 async function ov(){let r=await fetch('/api/overview'),d=await r.json();$('#status').textContent=(d.status==='live'?'Datos reales cargados':d.status==='historical_only'?'Histórico real cargado · sin fixtures actuales':'Fuente no disponible')+(d.updated?' · '+new Date(d.updated).toLocaleString('es-ES'):'');$('#models').textContent=d.models.length;$('#modelrows').innerHTML=d.models.map(m=>'<div class="modelrow"><span>'+m.league+' · '+m.matches+' partidos</span><strong>Brier '+(m.brier??'—')+'</strong></div>').join('')}
 function renderDates(){let dates=[...new Set(all.map(x=>x.date).filter(Boolean))];let h='<button class="'+(activeDate==='all'?'active':'')+'" onclick="setDate(\'all\')">Todos</button>';h+=dates.map(d=>'<button class="'+(activeDate===d?'active':'')+'" onclick="setDate(\''+d+'\')">'+d+'</button>').join('');$('#datebar').innerHTML=h}
 function setDate(d){activeDate=d;renderDates();renderMatches()}
-function renderMatches(){let threshold=+$('#ps').value/100;let items=all.filter(x=>activeDate==='all'||x.date===activeDate);let matching=items.filter(x=>x.probability>=threshold).length;$('#count').textContent=items.length;$('#matching').textContent=matching;$('#dayTitle').textContent=activeDate==='all'?'Todos los partidos disponibles':'Partidos · '+activeDate;$('#grid').innerHTML=items.length?items.map(x=>{let ok=x.probability>=threshold;return '<article class="card match"><div class="row"><div class="ey">'+x.league+(x.kickoff?' · '+x.kickoff:'')+'</div><span class="tag '+(ok?'ok':'no')+'">'+(ok?'✓ Cumple tu filtro':'Por debajo de '+Math.round(threshold*100)+'%')+'</span></div><h3>'+x.home+' <span class="mut">vs</span> '+x.away+'</h3><div class="mut">APUESTA SUGERIDA</div><div class="market">'+x.market+'</div><div class="prob">'+pc(x.probability)+'</div><p class="mut">Rango estimado '+pc(x.lower)+'–'+pc(x.upper)+'</p><div class="stats"><div class="stat"><strong>'+x.fair_odds.toFixed(2)+'</strong><span>cuota justa</span></div><div class="stat"><strong>'+(x.odds?x.odds.toFixed(2):'—')+'</strong><span>cuota pública ref.</span></div><div class="stat"><strong>'+pp(x.edge)+'</strong><span>edge</span></div></div><div class="edgeHelp">'+(x.edge==null?'Sin cuota pública comparable: mostramos la probabilidad y cuota justa del modelo.':'<strong>Edge '+pp(x.edge)+':</strong> ventaja estimada frente a la probabilidad del mercado.')+'</div><div><span class="tag">Datos '+x.quality+'</span><span class="tag">Muestra '+x.sample_size+'</span><span class="tag">'+(x.source||'Fuente pública')+'</span></div></article>'}).join(''):'<div class="card mut">No hay partidos disponibles en esta fecha desde la fuente pública.</div>'}
-async function loadMatches(){let r=await fetch('/api/matches'),d=await r.json();all=d.items||[];renderDates();renderMatches()}
+function renderMatches(){let threshold=+$('#ps').value/100;let items=all.filter(x=>activeDate==='all'||x.date===activeDate);let matching=items.filter(x=>x.probability!=null&&x.probability>=threshold).length;$('#count').textContent=items.length;$('#matching').textContent=matching;$('#dayTitle').textContent=activeDate==='all'?'Todos los partidos disponibles':'Partidos · '+activeDate;$('#grid').innerHTML=items.length?items.map(x=>{let ok=x.probability!=null&&x.probability>=threshold;return '<article class="card match"><div class="row"><div class="ey">'+x.league+(x.kickoff?' · '+x.kickoff:'')+'</div><span class="tag '+(ok?'ok':'no')+'">'+(x.probability==null?'Calculando %…':(ok?'✓ Cumple tu filtro':'Por debajo de '+Math.round(threshold*100)+'%'))+'</span></div><h3>'+x.home+' <span class="mut">vs</span> '+x.away+'</h3><div class="mut">APUESTA SUGERIDA</div><div class="market">'+x.market+'</div><div class="prob">'+pc(x.probability)+'</div><p class="mut">Rango estimado '+pc(x.lower)+'–'+pc(x.upper)+'</p><div class="stats"><div class="stat"><strong>'+(x.fair_odds?x.fair_odds.toFixed(2):'—')+'</strong><span>cuota justa</span></div><div class="stat"><strong>'+(x.odds?x.odds.toFixed(2):'—')+'</strong><span>cuota pública ref.</span></div><div class="stat"><strong>'+pp(x.edge)+'</strong><span>edge</span></div></div><div class="edgeHelp">'+(x.edge==null?'Sin cuota pública comparable: mostramos la probabilidad y cuota justa del modelo.':'<strong>Edge '+pp(x.edge)+':</strong> ventaja estimada frente a la probabilidad del mercado.')+'</div><div><span class="tag">Datos '+x.quality+'</span><span class="tag">Muestra '+x.sample_size+'</span><span class="tag">'+(x.source||'Fuente pública')+'</span></div></article>'}).join(''):'<div class="card mut">No hay partidos disponibles en esta fecha desde la fuente pública.</div>'}
+async function loadMatches(){
+  let fixtures=[];
+  const leagues={"eng.1":"E0","eng.2":"E1","eng.3":"E2","eng.4":"E3","sco.1":"SC0","esp.1":"SP1","esp.2":"SP2","ger.1":"D1","ger.2":"D2","ita.1":"I1","ita.2":"I2","fra.1":"F1","fra.2":"F2","ned.1":"N1","por.1":"P1","bel.1":"B1","tur.1":"T1"};
+  const now=new Date(), end=new Date(now.getTime()+6*86400000);
+  const fmt=d=>d.getFullYear()+String(d.getMonth()+1).padStart(2,'0')+String(d.getDate()).padStart(2,'0');
+  try{
+    const rs=await Promise.all(Object.entries(leagues).map(async([lg,div])=>{
+      try{
+        const u='https://site.api.espn.com/apis/site/v2/sports/soccer/'+lg+'/scoreboard?dates='+fmt(now)+'-'+fmt(end)+'&limit=200';
+        const r=await fetch(u); if(!r.ok) return []; const d=await r.json();
+        return (d.events||[]).map(ev=>{
+          const c=(ev.competitions||[{}])[0], cs=c.competitors||[];
+          const h=cs.find(x=>x.homeAway==='home'), a=cs.find(x=>x.homeAway==='away');
+          if(!h||!a)return null;
+          const dt=new Date(ev.date), dd=String(dt.getDate()).padStart(2,'0')+'/'+String(dt.getMonth()+1).padStart(2,'0')+'/'+String(dt.getFullYear()).slice(-2);
+          const tm=String(dt.getHours()).padStart(2,'0')+':'+String(dt.getMinutes()).padStart(2,'0');
+          return {Div:div,Date:dd,Time:tm,HomeTeam:h.team.displayName,AwayTeam:a.team.displayName,_source:'ESPN',_status:ev.status?.type?.description||'Scheduled'};
+        }).filter(Boolean);
+      }catch(e){return []}
+    }));
+    fixtures=rs.flat();
+  }catch(e){}
+  if(!fixtures.length){
+    try{
+      const r=await fetch('/api/matches'),d=await r.json();all=d.items||[];renderDates();renderMatches();return;
+    }catch(e){}
+  }
+  if(fixtures.length){
+    try{
+      const r=await fetch('/api/analyze-fixtures',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fixtures})});
+      const d=await r.json();all=d.items||[];
+    }catch(e){all=[]}
+  }
+  renderDates();renderMatches();
+}
 async function refreshData(){await fetch('/api/refresh',{method:'POST'});await ov();await loadMatches()}$('#ps').oninput=()=>{$('#pv').textContent=$('#ps').value+'%';renderMatches()};
 function startChallenge(){$('#challengeIntro').classList.add('hidden');challengeStep(1)}
 function challengeStep(n){['challengeSetup','challengeStep2','challengeStep3'].forEach(x=>$('#'+x).classList.add('hidden'));if(n===1)$('#challengeSetup').classList.remove('hidden');if(n===2)$('#challengeStep2').classList.remove('hidden');if(n===3)$('#challengeStep3').classList.remove('hidden')}
 async function buildChallenge(){let body={bankroll:+$('#bank').value,target:+$('#target').value,difficulty:$('#diff').value};let r=await fetch('/api/challenge',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),d=await r.json();['challengeSetup','challengeStep2','challengeStep3'].forEach(x=>$('#'+x).classList.add('hidden'));let html='<div class="card"><div class="ey">TU RETO · '+d.difficulty.toUpperCase()+'</div><h2>'+d.starting_bankroll.toFixed(2)+' € → '+d.target.toFixed(2)+' €</h2><p class="mut">Selecciones mínimas: '+pc(d.min_probability)+' · Probabilidad conjunta estimada de acertar toda la secuencia: <b>'+pc(d.sequence_probability)+'</b></p></div>';if(!d.steps.length)html+='<div class="card section"><p class="mut">Ahora mismo no hay partidos que cumplan el mínimo de este nivel. No añadimos apuestas ficticias.</p></div>';else html+=d.steps.map(x=>'<div class="card step"><div class="stepnum">PASO '+x.step+'</div><h3>'+x.home+' vs '+x.away+'</h3><div class="market">'+x.market+'</div><div class="prob">'+pc(x.probability)+'</div><div class="stats"><div class="stat"><strong>'+x.stake.toFixed(2)+' €</strong><span>stake · '+pc(x.stake_pct)+'</span></div><div class="stat"><strong>'+x.odds.toFixed(2)+'</strong><span>'+x.odds_type+'</span></div><div class="stat"><strong>'+x.bankroll_if_win.toFixed(2)+' €</strong><span>bankroll si gana</span></div></div><p class="mut">Si pierde: '+x.bankroll_if_lose.toFixed(2)+' €. No se aumenta el siguiente stake para recuperar la pérdida.</p></div>').join('');html+='<div class="card section"><p class="mut">'+d.note+'</p><button class="btn2" onclick="restartChallenge()">Crear otro reto</button></div>';$('#challengePlan').innerHTML=html;$('#challengePlan').classList.remove('hidden')}
 function restartChallenge(){$('#challengePlan').classList.add('hidden');$('#challengeIntro').classList.remove('hidden')}
-ov();loadMatches();setInterval(async()=>{await ov();await loadMatches()},600000);</script></body></html>'''
+ov();loadMatches();setTimeout(async()=>{await ov();await loadMatches()},12000);setInterval(async()=>{await ov();await loadMatches()},600000);</script></body></html>'''
 
 @app.get("/",response_class=HTMLResponse)
 def root(): return HTML
