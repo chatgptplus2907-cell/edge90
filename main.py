@@ -28,6 +28,11 @@ FIXTURES="https://www.football-data.co.uk/matches/resources/fixtures.csv"
 ESPN_BASE="https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
 SPORTSDB_BASE="https://www.thesportsdb.com/api/v1/json/123"
 API_FOOTBALL_BASE="https://v3.football.api-sports.io"
+API_FOOTBALL_ID_MAP={
+39:"E0",40:"E1",41:"E2",42:"E3",179:"SC0",
+140:"SP1",141:"SP2",78:"D1",79:"D2",135:"I1",136:"I2",
+61:"F1",62:"F2",88:"N1",94:"P1",144:"B1",203:"T1"
+}
 OPENLIGA_BASE="https://api.openligadb.de"
 OPENLIGA_KNOWN={"bl1":"D1","bl2":"D2","dfb":"GLOBAL","cl":"UCL","el":"UEL"}
 SPORTSDB_LEAGUES={
@@ -161,7 +166,7 @@ async def fetch_api_football(date_from,date_to):
                     except Exception:
                         date_txt=d.strftime("%d/%m/%y"); time_txt=""
                     out.append({
-                        "Div":f"APIF:{lg.get('id','')}",
+                        "Div":API_FOOTBALL_ID_MAP.get(lg.get("id"),f"APIF:{lg.get('id','')}"),
                         "Date":date_txt,"Time":time_txt,
                         "HomeTeam":home,"AwayTeam":away,
                         "_source":"API-Football","_event_id":str(fx.get("id") or ""),
@@ -456,8 +461,35 @@ def recommendations(min_probability:float=Query(.55,ge=.5,le=.95)):
 @app.get("/api/matches")
 def matches():
     out=[]
-    for i,r in enumerate(STATE["recommendations"]):
-        x=dict(r);x["id"]=i+1;out.append(x)
+    for i,row in enumerate(STATE["fixtures"]):
+        div=row.get("Div")
+        model=STATE["models"].get(div)
+        if model and row.get("HomeTeam") and row.get("AwayTeam"):
+            try:
+                teams=set(model.attack.keys())|set(model.defence.keys())
+                rrrow=dict(row)
+                rrrow["HomeTeam"]=resolve_team(rrrow["HomeTeam"],teams)
+                rrrow["AwayTeam"]=resolve_team(rrrow["AwayTeam"],teams)
+                x=recommendation(model,rrrow)
+                x["id"]=i+1
+                x["source"]=row.get("_source","Calendario público")
+                x["event_status"]=row.get("_status","Scheduled")
+                x["event_id"]=row.get("_event_id")
+                x["probability_source"]="model"
+                out.append(x)
+                continue
+            except Exception:
+                pass
+        out.append({
+            "id":i+1,"div":div,
+            "league":row.get("_league_name") or LEAGUES.get(div,div or "Competición"),
+            "home":row.get("HomeTeam",""),"away":row.get("AwayTeam",""),
+            "date":row.get("Date",""),"kickoff":row.get("Time",""),
+            "probability":None,"lower":None,"upper":None,"fair_odds":None,"odds":None,"edge":None,
+            "market":"Sin modelo suficiente todavía","quality":"Partido real","sample_size":0,
+            "source":row.get("_source","Calendario público"),"event_status":row.get("_status","Scheduled"),
+            "probability_source":"none"
+        })
     out.sort(key=lambda x:(x.get("date",""),x.get("kickoff",""),x.get("league",""),x.get("home","")))
     return {"items":out,"count":len(out),"status":STATE["status"],"updated":STATE["updated"]}
 
@@ -561,7 +593,7 @@ const $=s=>document.querySelector(s);let all=[],activeDate='all';function pc(x){
 async function ov(){let r=await fetch('/api/overview'),d=await r.json();$('#status').textContent=(d.status==='live'?'Datos reales cargados':d.status==='historical_only'?'Histórico real cargado · sin fixtures actuales':'Fuente no disponible')+(d.updated?' · '+new Date(d.updated).toLocaleString('es-ES'):'');$('#models').textContent=d.models.length;$('#modelrows').innerHTML=d.models.map(m=>'<div class="modelrow"><span>'+m.league+' · '+m.matches+' partidos</span><strong>Brier '+(m.brier??'—')+'</strong></div>').join('')}
 function renderDates(){let dates=[...new Set(all.map(x=>x.date).filter(Boolean))];let h='<button class="'+(activeDate==='all'?'active':'')+'" onclick="setDate(\'all\')">Todos</button>';h+=dates.map(d=>'<button class="'+(activeDate===d?'active':'')+'" onclick="setDate(\''+d+'\')">'+d+'</button>').join('');$('#datebar').innerHTML=h}
 function setDate(d){activeDate=d;renderDates();renderMatches()}
-function renderMatches(){let threshold=+$('#ps').value/100;let items=all.filter(x=>activeDate==='all'||x.date===activeDate);let matching=items.filter(x=>x.probability!=null&&x.probability>=threshold).length;$('#count').textContent=items.length;$('#matching').textContent=matching;$('#dayTitle').textContent=activeDate==='all'?'Todos los partidos disponibles':'Partidos · '+activeDate;$('#grid').innerHTML=items.length?items.map(x=>{let ok=x.probability!=null&&x.probability>=threshold;return '<article class="card match"><div class="row"><div class="ey">'+x.league+(x.kickoff?' · '+x.kickoff:'')+'</div><span class="tag '+(ok?'ok':'no')+'">'+(x.probability==null?'Calculando %…':(ok?'✓ Cumple tu filtro':'Por debajo de '+Math.round(threshold*100)+'%'))+'</span></div><h3>'+x.home+' <span class="mut">vs</span> '+x.away+'</h3><div class="mut">APUESTA SUGERIDA</div><div class="market">'+x.market+'</div><div class="prob">'+pc(x.probability)+'</div><p class="mut">'+(x.probability_source==='market'?'Probabilidad implícita ajustada del mercado':(x.probability==null?'Sin porcentaje verificable':'Rango estimado '+pc(x.lower)+'–'+pc(x.upper)))+'</p><div class="stats"><div class="stat"><strong>'+(x.fair_odds?x.fair_odds.toFixed(2):'—')+'</strong><span>cuota justa</span></div><div class="stat"><strong>'+(x.odds?x.odds.toFixed(2):'—')+'</strong><span>cuota pública ref.</span></div><div class="stat"><strong>'+pp(x.edge)+'</strong><span>edge</span></div></div><div class="edgeHelp">'+(x.edge==null?'Sin cuota pública comparable: mostramos la probabilidad y cuota justa del modelo.':'<strong>Edge '+pp(x.edge)+':</strong> ventaja estimada frente a la probabilidad del mercado.')+'</div><div><span class="tag">Datos '+x.quality+'</span><span class="tag">Muestra '+x.sample_size+'</span><span class="tag">'+(x.source||'Fuente pública')+'</span></div></article>'}).join(''):'<div class="card mut">No hay partidos disponibles en esta fecha desde la fuente pública.</div>'}
+function renderMatches(){let threshold=+$('#ps').value/100;let items=all.filter(x=>activeDate==='all'||x.date===activeDate);let matching=items.filter(x=>x.probability!=null&&x.probability>=threshold).length;$('#count').textContent=items.length;$('#matching').textContent=matching;$('#dayTitle').textContent=activeDate==='all'?'Todos los partidos disponibles':'Partidos · '+activeDate;$('#grid').innerHTML=items.length?items.map(x=>{let ok=x.probability!=null&&x.probability>=threshold;return '<article class="card match"><div class="row"><div class="ey">'+x.league+(x.kickoff?' · '+x.kickoff:'')+'</div><span class="tag '+(ok?'ok':'no')+'">'+(x.probability==null?'Partido real · sin % todavía':(ok?'✓ Cumple tu filtro':'Por debajo de '+Math.round(threshold*100)+'%'))+'</span></div><h3>'+x.home+' <span class="mut">vs</span> '+x.away+'</h3><div class="mut">APUESTA SUGERIDA</div><div class="market">'+x.market+'</div><div class="prob">'+pc(x.probability)+'</div><p class="mut">'+(x.probability_source==='market'?'Probabilidad implícita ajustada del mercado':(x.probability==null?'Sin porcentaje verificable':'Rango estimado '+pc(x.lower)+'–'+pc(x.upper)))+'</p><div class="stats"><div class="stat"><strong>'+(x.fair_odds?x.fair_odds.toFixed(2):'—')+'</strong><span>cuota justa</span></div><div class="stat"><strong>'+(x.odds?x.odds.toFixed(2):'—')+'</strong><span>cuota pública ref.</span></div><div class="stat"><strong>'+pp(x.edge)+'</strong><span>edge</span></div></div><div class="edgeHelp">'+(x.edge==null?'Sin cuota pública comparable: mostramos la probabilidad y cuota justa del modelo.':'<strong>Edge '+pp(x.edge)+':</strong> ventaja estimada frente a la probabilidad del mercado.')+'</div><div><span class="tag">Datos '+x.quality+'</span><span class="tag">Muestra '+x.sample_size+'</span><span class="tag">'+(x.source||'Fuente pública')+'</span></div></article>'}).join(''):'<div class="card mut">No hay partidos disponibles en esta fecha desde la fuente pública.</div>'}
 async function loadMatches(){
   let fixtures=[];
   const leagues={
@@ -662,6 +694,7 @@ async function loadMatches(){
   if(!fixtures.length){
     try{
       const r=await fetch('/api/matches',{cache:'no-store'}),d=await r.json();all=d.items||[];
+      const td=dmy(now); if(all.some(x=>x.date===td)) activeDate=td; else activeDate='all';
       renderDates();renderMatches();return;
     }catch(e){}
   }
