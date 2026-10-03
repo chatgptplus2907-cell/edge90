@@ -10,12 +10,17 @@ app = FastAPI(title="EDGE90", version="1.0")
 LEAGUES={
 "E0":"Premier League","E1":"Championship","E2":"League One","E3":"League Two","SC0":"Scottish Premiership",
 "SP1":"LaLiga","SP2":"LaLiga 2","D1":"Bundesliga","D2":"Bundesliga 2","I1":"Serie A","I2":"Serie B",
-"F1":"Ligue 1","F2":"Ligue 2","N1":"Eredivisie","P1":"Primeira Liga","B1":"Belgian Pro League","T1":"Süper Lig"
+"F1":"Ligue 1","F2":"Ligue 2","N1":"Eredivisie","P1":"Primeira Liga","B1":"Belgian Pro League","T1":"Süper Lig",
+"SC1":"Scottish Championship","SC2":"Scottish League One","SC3":"Scottish League Two","G1":"Super League Greece",
+"MLS":"MLS","MEX1":"Liga MX","BRA1":"Brasileirão","ARG1":"Liga Profesional Argentina","JPN1":"J1 League","AUS1":"A-League",
+"UCL":"Champions League","UEL":"Europa League","UECL":"Conference League",
+"INT-FRIENDLY":"Amistosos internacionales","WCQ-UEFA":"Clasificación Mundial UEFA","WCQ-CONMEBOL":"Clasificación Mundial CONMEBOL",
+"WCQ-CONCACAF":"Clasificación Mundial CONCACAF","WCQ-AFC":"Clasificación Mundial AFC","WCQ-CAF":"Clasificación Mundial CAF","UNL":"UEFA Nations League"
 }
 ESPN_LEAGUES={
-"eng.1":"E0","eng.2":"E1","eng.3":"E2","eng.4":"E3","sco.1":"SC0",
+"eng.1":"E0","eng.2":"E1","eng.3":"E2","eng.4":"E3","sco.1":"SC0","sco.2":"SC1","sco.3":"SC2","sco.4":"SC3",
 "esp.1":"SP1","esp.2":"SP2","ger.1":"D1","ger.2":"D2","ita.1":"I1","ita.2":"I2",
-"fra.1":"F1","fra.2":"F2","ned.1":"N1","por.1":"P1","bel.1":"B1","tur.1":"T1"
+"fra.1":"F1","fra.2":"F2","ned.1":"N1","por.1":"P1","bel.1":"B1","tur.1":"T1","gre.1":"G1"
 }
 SEASONS=["2425","2526","2627"]
 BASE="https://www.football-data.co.uk/mmz4281/{season}/{div}.csv"
@@ -35,6 +40,13 @@ def fnum(x,d=None):
 def parse_csv(text): return list(csv.DictReader(io.StringIO(text.lstrip("\ufeff"))))
 def pmf(k,l): return math.exp(-l)*l**k/math.factorial(k)
 def fair(p): return round(1/max(.01,min(.99,p)),2)
+
+def american_to_decimal(v):
+    try:
+        v=float(v)
+        if v==0:return None
+        return 1+100/abs(v) if v<0 else 1+v/100
+    except:return None
 
 def probs(lh,la):
     h=d=a=o15=o25=btts=0.0
@@ -333,13 +345,28 @@ def analyze_fixtures(batch:FixtureBatch):
         div=row.get("Div")
         model=STATE["models"].get(div)
         if not model or not row.get("HomeTeam") or not row.get("AwayTeam"):
+            mo=row.get("_moneyline") or {}
+            decs={
+                "HOME":american_to_decimal(mo.get("home")),
+                "DRAW":american_to_decimal(mo.get("draw")),
+                "AWAY":american_to_decimal(mo.get("away")),
+            }
+            valid=[(k,v) for k,v in decs.items() if v and v>1]
+            market_prob=None; market_label="Sin % verificable"; chosen_odds=None
+            if len(valid)>=2:
+                inv={k:1/v for k,v in valid}; total=sum(inv.values())
+                adj={k:p/total for k,p in inv.items()}
+                key=max(adj,key=adj.get); market_prob=adj[key]; chosen_odds=decs[key]
+                market_label={"HOME":f"{row.get('HomeTeam','')} gana","DRAW":"Empate","AWAY":f"{row.get('AwayTeam','')} gana"}[key]
             out.append({
                 "id":i+1,"div":div,"league":LEAGUES.get(div,div or "Competición"),
                 "home":row.get("HomeTeam",""),"away":row.get("AwayTeam",""),
                 "date":row.get("Date",""),"kickoff":row.get("Time",""),
-                "probability":None,"lower":None,"upper":None,"fair_odds":None,"odds":None,"edge":None,
-                "market":"Modelo preparando datos","quality":"Pendiente","sample_size":0,
-                "source":row.get("_source","Calendario público"),"event_status":row.get("_status","Scheduled")
+                "probability":market_prob,"lower":None,"upper":None,"fair_odds":fair(market_prob) if market_prob else None,
+                "odds":chosen_odds,"edge":None,"market":market_label,
+                "quality":"Mercado" if market_prob else "Sin modelo","sample_size":0,
+                "source":row.get("_source","Calendario público"),"event_status":row.get("_status","Scheduled"),
+                "probability_source":"market" if market_prob else "none"
             })
             continue
         try:
@@ -348,7 +375,7 @@ def analyze_fixtures(batch:FixtureBatch):
             rrrow["HomeTeam"]=resolve_team(rrrow["HomeTeam"],teams)
             rrrow["AwayTeam"]=resolve_team(rrrow["AwayTeam"],teams)
             rr=recommendation(model,rrrow)
-            rr["id"]=i+1;rr["source"]=row.get("_source","Calendario público")
+            rr["id"]=i+1;rr["source"]=row.get("_source","Calendario público");rr["probability_source"]="model"
             rr["event_status"]=row.get("_status","Scheduled")
             out.append(rr)
         except Exception:
@@ -407,11 +434,20 @@ const $=s=>document.querySelector(s);let all=[],activeDate='all';function pc(x){
 async function ov(){let r=await fetch('/api/overview'),d=await r.json();$('#status').textContent=(d.status==='live'?'Datos reales cargados':d.status==='historical_only'?'Histórico real cargado · sin fixtures actuales':'Fuente no disponible')+(d.updated?' · '+new Date(d.updated).toLocaleString('es-ES'):'');$('#models').textContent=d.models.length;$('#modelrows').innerHTML=d.models.map(m=>'<div class="modelrow"><span>'+m.league+' · '+m.matches+' partidos</span><strong>Brier '+(m.brier??'—')+'</strong></div>').join('')}
 function renderDates(){let dates=[...new Set(all.map(x=>x.date).filter(Boolean))];let h='<button class="'+(activeDate==='all'?'active':'')+'" onclick="setDate(\'all\')">Todos</button>';h+=dates.map(d=>'<button class="'+(activeDate===d?'active':'')+'" onclick="setDate(\''+d+'\')">'+d+'</button>').join('');$('#datebar').innerHTML=h}
 function setDate(d){activeDate=d;renderDates();renderMatches()}
-function renderMatches(){let threshold=+$('#ps').value/100;let items=all.filter(x=>activeDate==='all'||x.date===activeDate);let matching=items.filter(x=>x.probability!=null&&x.probability>=threshold).length;$('#count').textContent=items.length;$('#matching').textContent=matching;$('#dayTitle').textContent=activeDate==='all'?'Todos los partidos disponibles':'Partidos · '+activeDate;$('#grid').innerHTML=items.length?items.map(x=>{let ok=x.probability!=null&&x.probability>=threshold;return '<article class="card match"><div class="row"><div class="ey">'+x.league+(x.kickoff?' · '+x.kickoff:'')+'</div><span class="tag '+(ok?'ok':'no')+'">'+(x.probability==null?'Calculando %…':(ok?'✓ Cumple tu filtro':'Por debajo de '+Math.round(threshold*100)+'%'))+'</span></div><h3>'+x.home+' <span class="mut">vs</span> '+x.away+'</h3><div class="mut">APUESTA SUGERIDA</div><div class="market">'+x.market+'</div><div class="prob">'+pc(x.probability)+'</div><p class="mut">Rango estimado '+pc(x.lower)+'–'+pc(x.upper)+'</p><div class="stats"><div class="stat"><strong>'+(x.fair_odds?x.fair_odds.toFixed(2):'—')+'</strong><span>cuota justa</span></div><div class="stat"><strong>'+(x.odds?x.odds.toFixed(2):'—')+'</strong><span>cuota pública ref.</span></div><div class="stat"><strong>'+pp(x.edge)+'</strong><span>edge</span></div></div><div class="edgeHelp">'+(x.edge==null?'Sin cuota pública comparable: mostramos la probabilidad y cuota justa del modelo.':'<strong>Edge '+pp(x.edge)+':</strong> ventaja estimada frente a la probabilidad del mercado.')+'</div><div><span class="tag">Datos '+x.quality+'</span><span class="tag">Muestra '+x.sample_size+'</span><span class="tag">'+(x.source||'Fuente pública')+'</span></div></article>'}).join(''):'<div class="card mut">No hay partidos disponibles en esta fecha desde la fuente pública.</div>'}
+function renderMatches(){let threshold=+$('#ps').value/100;let items=all.filter(x=>activeDate==='all'||x.date===activeDate);let matching=items.filter(x=>x.probability!=null&&x.probability>=threshold).length;$('#count').textContent=items.length;$('#matching').textContent=matching;$('#dayTitle').textContent=activeDate==='all'?'Todos los partidos disponibles':'Partidos · '+activeDate;$('#grid').innerHTML=items.length?items.map(x=>{let ok=x.probability!=null&&x.probability>=threshold;return '<article class="card match"><div class="row"><div class="ey">'+x.league+(x.kickoff?' · '+x.kickoff:'')+'</div><span class="tag '+(ok?'ok':'no')+'">'+(x.probability==null?'Calculando %…':(ok?'✓ Cumple tu filtro':'Por debajo de '+Math.round(threshold*100)+'%'))+'</span></div><h3>'+x.home+' <span class="mut">vs</span> '+x.away+'</h3><div class="mut">APUESTA SUGERIDA</div><div class="market">'+x.market+'</div><div class="prob">'+pc(x.probability)+'</div><p class="mut">'+(x.probability_source==='market'?'Probabilidad implícita ajustada del mercado':(x.probability==null?'Sin porcentaje verificable':'Rango estimado '+pc(x.lower)+'–'+pc(x.upper)))+'</p><div class="stats"><div class="stat"><strong>'+(x.fair_odds?x.fair_odds.toFixed(2):'—')+'</strong><span>cuota justa</span></div><div class="stat"><strong>'+(x.odds?x.odds.toFixed(2):'—')+'</strong><span>cuota pública ref.</span></div><div class="stat"><strong>'+pp(x.edge)+'</strong><span>edge</span></div></div><div class="edgeHelp">'+(x.edge==null?'Sin cuota pública comparable: mostramos la probabilidad y cuota justa del modelo.':'<strong>Edge '+pp(x.edge)+':</strong> ventaja estimada frente a la probabilidad del mercado.')+'</div><div><span class="tag">Datos '+x.quality+'</span><span class="tag">Muestra '+x.sample_size+'</span><span class="tag">'+(x.source||'Fuente pública')+'</span></div></article>'}).join(''):'<div class="card mut">No hay partidos disponibles en esta fecha desde la fuente pública.</div>'}
 async function loadMatches(){
   let fixtures=[];
-  const leagues={"eng.1":"E0","eng.2":"E1","eng.3":"E2","eng.4":"E3","sco.1":"SC0","esp.1":"SP1","esp.2":"SP2","ger.1":"D1","ger.2":"D2","ita.1":"I1","ita.2":"I2","fra.1":"F1","fra.2":"F2","ned.1":"N1","por.1":"P1","bel.1":"B1","tur.1":"T1"};
-  const now=new Date(), end=new Date(now.getTime()+6*86400000);
+  const leagues={
+"eng.1":"E0","eng.2":"E1","eng.3":"E2","eng.4":"E3",
+"sco.1":"SC0","sco.2":"SC1","sco.3":"SC2","sco.4":"SC3",
+"esp.1":"SP1","esp.2":"SP2","ger.1":"D1","ger.2":"D2","ita.1":"I1","ita.2":"I2","fra.1":"F1","fra.2":"F2",
+"ned.1":"N1","por.1":"P1","bel.1":"B1","tur.1":"T1","gre.1":"G1",
+"usa.1":"MLS","mex.1":"MEX1","bra.1":"BRA1","arg.1":"ARG1","jpn.1":"JPN1","aus.1":"AUS1",
+"uefa.champions":"UCL","uefa.europa":"UEL","uefa.europa.conf":"UECL",
+"fifa.friendly":"INT-FRIENDLY","fifa.worldq.uefa":"WCQ-UEFA","fifa.worldq.conmebol":"WCQ-CONMEBOL",
+"fifa.worldq.concacaf":"WCQ-CONCACAF","fifa.worldq.afc":"WCQ-AFC","fifa.worldq.caf":"WCQ-CAF","uefa.nations":"UNL"
+};
+  const now=new Date(), end=new Date(now.getTime()+14*86400000);
   const fmt=d=>d.getFullYear()+String(d.getMonth()+1).padStart(2,'0')+String(d.getDate()).padStart(2,'0');
   try{
     const rs=await Promise.all(Object.entries(leagues).map(async([lg,div])=>{
@@ -424,7 +460,9 @@ async function loadMatches(){
           if(!h||!a)return null;
           const dt=new Date(ev.date), dd=String(dt.getDate()).padStart(2,'0')+'/'+String(dt.getMonth()+1).padStart(2,'0')+'/'+String(dt.getFullYear()).slice(-2);
           const tm=String(dt.getHours()).padStart(2,'0')+':'+String(dt.getMinutes()).padStart(2,'0');
-          return {Div:div,Date:dd,Time:tm,HomeTeam:h.team.displayName,AwayTeam:a.team.displayName,_source:'ESPN',_status:ev.status?.type?.description||'Scheduled'};
+          const oo=(c.odds||[])[0]||{};
+          const ml={home:oo.homeTeamOdds?.moneyLine??oo.homeTeamOdds?.moneyline??null,draw:oo.drawOdds?.moneyLine??oo.drawOdds?.moneyline??null,away:oo.awayTeamOdds?.moneyLine??oo.awayTeamOdds?.moneyline??null};
+          return {Div:div,Date:dd,Time:tm,HomeTeam:h.team.displayName,AwayTeam:a.team.displayName,_source:'ESPN',_status:ev.status?.type?.description||'Scheduled',_moneyline:ml};
         }).filter(Boolean);
       }catch(e){return []}
     }));
@@ -441,6 +479,8 @@ async function loadMatches(){
       const d=await r.json();all=d.items||[];
     }catch(e){all=[]}
   }
+  const td=String(now.getDate()).padStart(2,'0')+'/'+String(now.getMonth()+1).padStart(2,'0')+'/'+String(now.getFullYear()).slice(-2);
+  if(all.some(x=>x.date===td)) activeDate=td; else activeDate='all';
   renderDates();renderMatches();
 }
 async function refreshData(){await fetch('/api/refresh',{method:'POST'});await ov();await loadMatches()}$('#ps').oninput=()=>{$('#pv').textContent=$('#ps').value+'%';renderMatches()};
